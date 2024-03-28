@@ -135,6 +135,12 @@ impl ThreadControlBlock {
 	}
 }
 
+impl Drop for ThreadControlBlock {
+	fn drop(&mut self) {
+		assert_ne!(self.state, ThreadState::Running, "Cannot drop currently running thread as this would remove the current stack");
+	}
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ThreadState {
 	Ready,
