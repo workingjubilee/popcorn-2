@@ -1,5 +1,6 @@
 use core::arch::asm;
 use core::convert::Into;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// A mutual exclusion primitive useful for protecting shared data
@@ -11,6 +12,24 @@ pub type Spinlock<T> = lock_api::Mutex<RawSpinlock, T>;
 /// An RAII implementation of a “scoped lock” of a mutex. When this structure is dropped (falls out of scope), the lock will be unlocked.
 #[stable(feature = "kernel_core_api", since = "0.1.0")]
 pub type MutexGuard<'a, T> = lock_api::MutexGuard<'a, RawSpinlock, T>;
+
+#[stable(feature = "kernel_core_api", since = "0.1.0")]
+pub trait MutexGuardExt {
+    #[stable(feature = "kernel_core_api", since = "0.1.0")]
+    fn unlock_no_interrupts(this: Self);
+}
+
+#[stable(feature = "kernel_core_api", since = "0.1.0")]
+impl<T> MutexGuardExt for MutexGuard<'_, T> {
+    fn unlock_no_interrupts(this: Self) {
+        let this = ManuallyDrop::new(this);
+        unsafe {
+            let spinlock = Self::mutex(&this).raw();
+            spinlock.unlock_no_interrupts();
+        }
+    }
+}
+
 #[unstable(feature = "kernel_spinlocks", issue = "none")]
 pub type SpinlockGuard<'a, T> = lock_api::MutexGuard<'a, RawSpinlock, T>;
 
@@ -56,6 +75,18 @@ impl TryFrom<u8> for State {
 pub struct RawSpinlock {
     state: AtomicU8,
     irq_state: AtomicUsize
+}
+
+impl RawSpinlock {
+    unsafe fn unlock_no_interrupts(&self) {
+        let old_state = self.state.swap(State::Unlocked.into(), Ordering::Release);
+        let old_state = State::try_from(old_state).expect("Mutex in undefined state");
+
+        match old_state {
+            State::Unlocked => unreachable!("Mutex was unlocked while unlocked"),
+            State::Locked => {},
+        }
+    }
 }
 
 #[stable(feature = "kernel_core_api", since = "0.1.0")]

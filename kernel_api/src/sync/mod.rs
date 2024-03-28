@@ -7,7 +7,7 @@
 use core::ops::Deref;
 #[cfg(not(feature = "use_std"))]
 #[stable(feature = "kernel_core_api", since = "0.1.0")]
-pub use mutex::{Mutex, MutexGuard};
+pub use mutex::{Mutex, MutexGuard, MutexGuardExt};
 #[cfg(feature = "use_std")]
 #[stable(feature = "kernel_core_api", since = "0.1.0")]
 pub use parking_lot::{Mutex, MutexGuard};
