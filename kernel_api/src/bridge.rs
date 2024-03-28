@@ -82,3 +82,10 @@ pub mod memory {
 		pub static GLOBAL_DMA: GlobalAllocator;
 	}
 }
+
+pub mod time {
+	extern "Rust" {
+		#[link_name = "__popcorn_system_time"]
+		pub fn system_time() -> u128;
+	}
+}

@@ -1,12 +1,17 @@
 use alloc::borrow::Cow;
+use core::arch::asm;
+use core::cmp::Ordering;
 use core::num::NonZeroUsize;
+use core::time::Duration;
+use log::{debug, warn};
 use kernel_api::memory::mapping::Stack;
 use kernel_api::memory::physical::{highmem, OwnedFrames};
 use kernel_api::memory::r#virtual::{Global, OwnedPages};
-use crate::hal::paging2::TTableTy;
-use crate::hal::{ThreadControlBlock, ThreadState};
-use utils::handoff;
+use kernel_api::time::Instant;
+use crate::hal::{Hal, HalTy, ThreadControlBlock, ThreadState};
 use scheduler::Tid;
+use crate::hal::timing::{Timer, Eoi};
+use crate::interrupts::irq_handler;
 
 pub mod scheduler;
 
@@ -35,11 +40,109 @@ pub unsafe fn init(handoff_data: crate::HandoffWrapper) -> Tid {
 		state: ThreadState::Running,
 		save_state: Default::default(),
 	};
-	assert!(scheduler.tasks.insert(Tid(0), tcb).is_none());
+	
+	scheduler.init(tcb);
 
 	Tid(0)
 }
 
 pub fn thread_yield() {
-	scheduler::SCHEDULER.lock().schedule();
+	defer_schedule();
+}
+
+pub fn block(reason: ThreadState) {
+	scheduler::SCHEDULER.lock().block(reason);
+}
+
+#[derive(Debug, Copy, Clone)]
+struct SchedulerEvent {
+	time: Instant,
+	tid: Tid,
+	action: EventTy,
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+enum EventTy {
+	Unblock,
+}
+
+impl Ord for SchedulerEvent {
+	fn cmp(&self, other: &Self) -> Ordering {
+		self.time.cmp(&other.time)
+	}
+}
+
+impl PartialOrd for SchedulerEvent {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl PartialEq for SchedulerEvent {
+	fn eq(&self, other: &Self) -> bool {
+		self.time.eq(&other.time)
+	}
+}
+
+impl Eq for SchedulerEvent {}
+
+fn push_to_global_sleep_queue(wake_time: Instant) {
+	todo!()
+}
+
+fn pinned_sleep(time_of_wake: Instant) {
+	let mut guard = scheduler::SCHEDULER.lock();
+	let sleep_event = SchedulerEvent {
+		tid: guard.current_tid(),
+		time: time_of_wake,
+		action: EventTy::Unblock
+	};
+	debug!("sleeping tid {:?}", sleep_event.tid);
+	guard.event_queue.add(sleep_event);
+	guard.block(ThreadState::Sleeping);
+}
+
+pub fn sleep(duration: Duration) {
+	if duration <= Duration::from_secs(1) {
+		// Core pinned sleep
+		pinned_sleep(Instant::now() + duration);
+	} else {
+		todo!();
+		push_to_global_sleep_queue(Instant::now() + duration);
+	}
+}
+
+pub fn sleep_until(wake_time: Instant) {
+	// to avoid having to calculate time until wake, always do a pinned sleep and have it pulled from back of queue later
+	pinned_sleep(wake_time);
+}
+
+pub fn exit() -> ! {
+	let mut guard = scheduler::SCHEDULER.lock();
+	guard.queue_for_deletion();
+	drop(guard); // drop guard before end of scope to ensure deferred schedule goes through
+	unreachable!("Returned to deleted task")
+}
+
+#[naked]
+pub unsafe extern "C" fn thread_startup() {
+	extern "C" fn thread_startup_inner() {
+		unsafe {
+			scheduler::SCHEDULER.unlock();
+		}
+	}
+
+	asm!(
+	"pop rbp", // aligns to 16 bytes
+	"call {}",
+	"pop rdi", // pop args off stack
+	"pop rsi",
+	"pop rdx",
+	"pop rcx",
+	"ret",
+	sym thread_startup_inner, options(noreturn));
+}
+
+pub fn defer_schedule() {
+	crate::hal::arch::apic::send_self_ipi(0x30);
 }

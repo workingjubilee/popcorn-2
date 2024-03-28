@@ -48,6 +48,9 @@
 #![feature(kernel_physical_allocator_non_contiguous)]
 #![feature(kernel_physical_allocator_location)]
 #![feature(kernel_ptr)]
+#![feature(kernel_time)]
+#![feature(slice_ptr_len)]
+#![feature(slice_ptr_get)]
 
 #![no_std]
 #![no_main]
@@ -94,8 +97,10 @@ mod task;
 mod threading;
 mod bmp;
 mod hal;
+mod timing;
 mod projection;
 mod mmio;
+mod interrupts;
 
 #[cfg(test)]
 pub mod test_harness;
@@ -120,18 +125,6 @@ macro_rules! u64 {
 #[macro_export]
 macro_rules! into {
     ($stuff:expr) => {($stuff).try_into().unwrap()};
-}
-
-#[thread_local]
-static IRQ_HANDLES: Mutex<BTreeMap<usize, Box<dyn FnMut() /* + Send ???*/>>> = Mutex::new(BTreeMap::new());
-
-#[inline]
-fn irq_handler(num: usize) {
-	if let Some(f) = IRQ_HANDLES.lock().get_mut(&num) {
-		(*f)();
-	} else {
-		warn!("Unhandled IRQ num {num}");
-	}
 }
 
 #[inline]
@@ -243,6 +236,7 @@ use kernel_api::memory::physical::highmem;
 use kernel_api::memory::r#virtual::Global;
 use kernel_api::ptr::Unique;
 use kernel_api::sync::Mutex;
+use kernel_api::time::Instant;
 use crate::hal::paging2::{construct_tables, TTable, TTableTy};
 use utils::handoff::MemoryType;
 use crate::hal::acpi::XPhysicalMapping;
@@ -349,7 +343,7 @@ fn kmain(handoff_data: HandoffWrapper) -> ! {
 		hal::acpi::init_tables(handoff_data.rsdp.addr);
 	}
 
-	let (update_line, picos_per_tick) = if let Some(ref fb) = handoff_data.framebuffer {
+	let (mut update_line, picos_per_tick) = if let Some(ref fb) = handoff_data.framebuffer {
 		let size = fb.stride * fb.height;
 		let stride = fb.stride;
 		let fb_data = unsafe { &mut *slice_from_raw_parts_mut(fb.buffer.as_ptr().cast::<u32>(), size) };
@@ -441,102 +435,55 @@ fn kmain(handoff_data: HandoffWrapper) -> ! {
 		HalTy::load_tls(tls_self_ptr);
 	}
 
-	{
-		if let Ok(hpet) = ::acpi::hpet::HpetInfo::new(hal::acpi::tables()) {
-			#[repr(C)]
-			#[derive(Debug)]
-			struct HpetHeader {
-				capabilities: u64,
-				_res0: u64,
-				configuration: u64,
-				_res1: u64,
-				status: u64,
-				_res2: [u64; 25],
-				counter: u64,
-				_res3: u64,
-			}
-
-			#[repr(C)]
-			#[derive(Debug)]
-			struct HpetTimer {
-				capabilities: u64,
-				comparator: u64,
-				fsb_route: u64,
-				_res: u64,
-			}
-
-			#[repr(C)]
-			#[derive(Debug)]
-			struct Hpet {
-				header: HpetHeader,
-				timers: [HpetTimer]
-			}
-
-			let hpet_map = unsafe { hal::acpi::Handler::new(&hal::acpi::Allocator).map_region::<HpetHeader>(hpet.base_address, mem::size_of::<HpetHeader>(), ()) };
-			let hpet_timer_count = ((hpet_map.capabilities >> 8) & 0b11111) + 1;
-			let hpet_size = mem::size_of::<HpetHeader>() + 0x20*(hpet_timer_count as usize);
-			drop(hpet_map);
-			let hpet_map = unsafe { hal::acpi::Handler::new(&hal::acpi::Allocator).map_region::<Hpet>(hpet.base_address, hpet_size, hpet_timer_count as usize) };
-			debug!("{:#x?}", hpet_map.deref());
-		}
-
-		<HalTy as Hal>::post_acpi_init();
-
-		if let Some(mut update_line) = update_line {
-			use crate::hal::timing::{Timer, Eoi};
-
-			let mut timer = <HalTy as Hal>::LocalTimer::get();
-			let eoi = timer.eoi_handle();
-
-			let tick_func = move || {
-				update_line();
-				eoi.send();
-			};
-			IRQ_HANDLES.lock().insert(48, Box::new(tick_func));
-
-			let time_period = timer.get_time_period_picos().unwrap() * 4;
-			timer.set_irq_number(48).unwrap();
-			timer.set_divisor(4).unwrap();
-			debug!("{time_period:?} {} {}", picos_per_tick.unwrap(), picos_per_tick.unwrap() / u128::from(time_period));
-			timer.start_periodic(picos_per_tick.unwrap() / u128::from(time_period)).unwrap();
-		}
-	}
-
 	let x = get_foo();
 	warn!("TLS value is {x}");
+
+	if let Ok(hpet) = ::acpi::hpet::HpetInfo::new(hal::acpi::tables()) {
+		unsafe { hal::arch::hpet::Hpet::init(hpet, hal::acpi::Handler::new(&hal::acpi::Allocator)); }
+	}
+
+	<HalTy as Hal>::post_acpi_init();
 
 	let init_thread = unsafe { threading::init(handoff_data) };
 	debug!("{init_thread:x?}");
 
-	fn foo() -> ! {
-		sprintln!("hello from foo!");
+	{
+		let update_line = update_line.as_mut().map(|f| f as &mut dyn FnMut());
 
-		threading::thread_yield();
+		if let Some(mut update_line) = update_line {
+			use crate::hal::timing::{Timer, Eoi};
 
-		unreachable!()
-	}
+			extern "C" fn animation_task((data, meta): (usize, usize)) -> ! {
+				let update_line = unsafe { &mut *core::ptr::from_raw_parts_mut::<dyn FnMut()>(data as *mut (), mem::transmute(meta)) };
+				let mut next_time = Instant::now();
+				loop {
+					next_time += Duration::from_nanos(1302083);
+					update_line();
+					threading::sleep_until(next_time);
+				}
+			}
 
-	fn bar() {
-		unsafe {
-			threading::scheduler::SCHEDULER.unlock();
+			let update_line_parts = (update_line as *mut dyn FnMut()).to_raw_parts();
+
+			{
+				let ttable = TTableTy::new(&*ktable(), highmem()).unwrap();
+				let task = ThreadControlBlock::new(
+					Cow::Borrowed("Boot animation"),
+					ttable,
+					threading::thread_startup,
+					animation_task,
+					(update_line_parts.0 as _, unsafe { mem::transmute(update_line_parts.1) })
+				);
+				let mut guard = threading::scheduler::SCHEDULER.lock();
+				guard.add_task(task);
+			}
 		}
 	}
 
-	{
-		let ttable = TTableTy::new(&*ktable(), highmem()).unwrap();
-		let task = ThreadControlBlock::new(
-			Cow::Borrowed("hellooo"),
-			ttable,
-			bar,
-			foo,
-		);
-		let mut guard = threading::scheduler::SCHEDULER.lock();
-		guard.add_task(task);
+	loop {
+		unsafe { asm!("hlt"); }
+		threading::thread_yield();
 	}
-
-	threading::thread_yield();
-
-	loop {}
 
 	let mut executor = Executor::new();
 	static mut WAKER: Option<Waker> = None;

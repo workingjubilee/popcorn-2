@@ -7,17 +7,20 @@ use core::ptr::addr_of_mut;
 use core::time::Duration;
 use acpi::madt::MadtEntry;
 use acpi::{AcpiHandler, PhysicalMapping};
-use log::{debug, info};
+use log::{debug, info, warn};
 use crate::hal::timing::{Eoi, Timer};
 use bit_field::BitField;
+use kernel_api::sync::{OnceLock, Syncify};
 use macros::Fields;
 use crate::hal;
 use timer::TimerMode;
+use crate::hal::arch::apic::ioapic::{ActiveLevel, Ioapics, LegacyMap, TriggerMode};
 use crate::mmio::MmioCell;
 use crate::threading::scheduler::IrqCell;
 use crate::projection::Project;
 
 mod timer;
+mod ioapic;
 
 macro_rules! apic_register_ty {
     () => {u32};
@@ -89,8 +92,8 @@ apic_registers! {
 		_res35,
 		_res36,
 		_res37,
-		_res38,
-		_res39,
+		icr_low,
+		icr_high,
 		timer_lvt: timer::Lvt,
 		thermal_sensor_lvt,
 		perf_monitor_lvt,
@@ -113,14 +116,13 @@ impl MmioCell<Apic> {
 	}
 }
 
-struct Lapic(OnceCell<IrqCell<PhysicalMapping<hal::acpi::Handler<'static>, Apic>>>, UnsafeCell<()>);
+struct Lapic(OnceLock<Syncify<IrqCell<PhysicalMapping<hal::acpi::Handler<'static>, Apic>>>>);
 
-#[thread_local]
-static LAPIC: Lapic = Lapic(OnceCell::new(), UnsafeCell::new(()));
+static LAPIC: Lapic = Lapic(OnceLock::new());
 
 pub type LapicTimer = &'static IrqCell<PhysicalMapping<hal::acpi::Handler<'static>, Apic>>;
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum SupportError {
 	NoLeaf(u32),
 	NoFreq
@@ -146,58 +148,61 @@ impl Timer for LapicTimer {
 	}
 
 	fn get_time_period_picos(&self) -> Result<u64, SupportError> {
-		let Ok(hpet) = acpi::hpet::HpetInfo::new(hal::acpi::tables()) else {
-			return Err(SupportError::NoFreq);
-		};
+		static CACHED_TIME: OnceLock<Result<u64, SupportError>> = OnceLock::new();
 
-		let borrow = self.lock();
-		let apic = unsafe { MmioCell::new(borrow.virtual_start().as_ptr()) };
+		*CACHED_TIME.get_or_init(|| {
+			let Ok(hpet) = acpi::hpet::HpetInfo::new(hal::acpi::tables()) else {
+				return Err(SupportError::NoFreq);
+			};
 
-		let (start, end, hpet_period) = {
-			use super::hpet::Header as Hpet;
+			let borrow = self.lock();
+			let apic = unsafe { MmioCell::new(borrow.virtual_start().as_ptr()) };
 
-			let hpet = unsafe { hal::acpi::Handler::new(&hal::acpi::Allocator).map_physical_region::<Hpet>(hpet.base_address, mem::size_of::<super::hpet::Header>()) };
-			let hpet = unsafe { MmioCell::new(hpet.virtual_start().as_ptr()) };
+			let (start, end, hpet_period) = {
+				use super::hpet::Header as Hpet;
 
-			let mut timer_lvt = apic.project::<Apic::timer_lvt>();
-			let mut timer_divide_register = apic.project::<Apic::timer_divide_config>();
-			let mut timer_initial_count = apic.project::<Apic::timer_initial_count>();
-			let timer_current_count = apic.project::<Apic::timer_current_count>();
+				let hpet = unsafe { hal::acpi::Handler::new(&hal::acpi::Allocator).map_physical_region::<Hpet>(hpet.base_address, mem::size_of::<super::hpet::Header>()) };
+				let hpet = unsafe { MmioCell::new(hpet.virtual_start().as_ptr()) };
 
-			let old_val = timer_lvt.read();
-			let val = old_val
-			        .with_mode(TimerMode::OneShot)
-					.with_mask(true);
-			timer_lvt.write(val);
+				let mut timer_lvt = apic.project::<Apic::timer_lvt>();
+				let mut timer_divide_register = apic.project::<Apic::timer_divide_config>();
+				let mut timer_initial_count = apic.project::<Apic::timer_initial_count>();
+				let timer_current_count = apic.project::<Apic::timer_current_count>();
 
-			let old_divide = timer_divide_register.read();
-			timer_divide_register.write(0); // div by 2
+				let old_val = timer_lvt.read();
+				let val = old_val
+						.with_mode(TimerMode::OneShot)
+						.with_mask(true);
+				timer_lvt.write(val);
 
-			let mut hpet_config_register = hpet.project::<Hpet::configuration>();
-			let hpet_config_old = hpet_config_register.read();
-			hpet_config_register.write( hpet_config_old | 1);
+				let old_divide = timer_divide_register.read();
+				timer_divide_register.write(0); // div by 2
 
-			let hpet_counter = hpet.project::<Hpet::counter>();
-			let hpet_start_count = hpet_counter.read();
+				let mut hpet_config_register = hpet.project::<Hpet::configuration>();
+				let hpet_config_old = hpet_config_register.read();
+				hpet_config_register.write(hpet_config_old.set_enabled(true));
 
-			timer_initial_count.write(1_000_000);
-			while timer_current_count.read() != 0 {}
+				let hpet_counter = hpet.project::<Hpet::counter>();
+				let hpet_start_count = hpet_counter.read();
 
-			let hpet_end_count = hpet_counter.read();
+				timer_initial_count.write(1_000_000);
+				while timer_current_count.read() != 0 {}
 
-			hpet_config_register.write(hpet_config_old);
-			timer_lvt.write(old_val);
-			timer_divide_register.write(old_divide);
+				let hpet_end_count = hpet_counter.read();
 
-			let hpet_capabilities = hpet.project::<Hpet::capabilities>().read()
-					.get_bits(32..=63);
+				hpet_config_register.write(hpet_config_old);
+				timer_lvt.write(old_val);
+				timer_divide_register.write(old_divide);
 
-			(hpet_start_count, hpet_end_count, hpet_capabilities)
-		};
+				let hpet_capabilities = hpet.project::<Hpet::capabilities>().read().period_femtoseconds();
 
-		let period_femptoseconds = (end - start) * hpet_period / 2_000_000;
+				(hpet_start_count, hpet_end_count, hpet_capabilities)
+			};
 
-		Ok(period_femptoseconds / 1000)
+			let period_femtoseconds = (end - start) * hpet_period / 2_000_000;
+
+			Ok(period_femtoseconds / 1000)
+		})
 	}
 
 	fn get_divisors(&self) -> impl IntoIterator<Item=u64> {
@@ -228,8 +233,7 @@ impl Timer for LapicTimer {
 		let apic = unsafe { MmioCell::new(borrow.virtual_start().as_ptr()) };
 
 		let val = apic.project::<Apic::timer_lvt>().read()
-		                                            .with_mode(TimerMode::OneShot)
-		                                            .with_mask(false);
+		                                            .with_mode(TimerMode::OneShot);
 		apic.project::<Apic::timer_lvt>().write(val);
 		apic.project::<Apic::timer_initial_count>().write(ticks.try_into()?);
 
@@ -241,8 +245,7 @@ impl Timer for LapicTimer {
 		let apic = unsafe { MmioCell::new(borrow.virtual_start().as_ptr()) };
 
 		let val = apic.project::<Apic::timer_lvt>().read()
-		                     .with_mode(TimerMode::Periodic)
-		                     .with_mask(false);
+		                     .with_mode(TimerMode::Periodic);
 		apic.project::<Apic::timer_lvt>().write(val);
 		apic.project::<Apic::timer_initial_count>().write(ticks.try_into()?);
 
@@ -275,15 +278,49 @@ pub(in crate::hal) fn init(spurious_vector: u8) {
 	};
 
 	let mut apic_addr = madt.local_apic_address as u64;
+	let mut ioapics = Ioapics::new();
+	let mut legacy_gsi_mapping = LegacyMap::pc_default();
 
 	for entry in madt.entries() {
 		match entry {
 			MadtEntry::LocalApicAddressOverride(addr) => {
 				apic_addr = addr.local_apic_address;
 			}
+			MadtEntry::IoApic(ioapic) => {
+				let gsi = ioapic.global_system_interrupt_base as usize;
+				let addr = ioapic.io_apic_address;
+				let ioapic = unsafe { ioapic::Ioapic::new(addr as usize, hal::acpi::Handler::new(&hal::acpi::Allocator)) };
+				debug!("Found I/O APIC with GSIs {} -> {} at {:#x}", gsi, gsi + ioapic.size(), addr);
+				ioapics.push(gsi, ioapic);
+			}
+			MadtEntry::InterruptSourceOverride(iso) => {
+				if iso.bus != 0 { warn!("Unknown interrupt bus: {iso:?}"); }
+				else {
+					let level = if iso.flags & 2 == 0 { ActiveLevel::High } else { ActiveLevel::Low };
+					let mode = if iso.flags & 8 == 0 { TriggerMode::Edge } else { TriggerMode::Level };
+					let entry = (iso.global_system_interrupt, mode, level);
+
+					match iso.irq {
+						0 => legacy_gsi_mapping.pit = entry,
+						1 => legacy_gsi_mapping.ps2_keyboard = entry,
+						3 => legacy_gsi_mapping.com2 = entry,
+						4 => legacy_gsi_mapping.com1 = entry,
+						5 => legacy_gsi_mapping.lpt2 = entry,
+						6 => legacy_gsi_mapping.floppy = entry,
+						8 => legacy_gsi_mapping.rtc = entry,
+						12 => legacy_gsi_mapping.ps2_mouse = entry,
+						14 => legacy_gsi_mapping.ata_primary = entry,
+						15 => legacy_gsi_mapping.ata_secondary = entry,
+						irq => warn!("Unused GSI override: {irq}={entry:?}"),
+					}
+				}
+			}
 			_ => {}
 		}
 	}
+
+	debug!("I/O APICs: {:?}", ioapics);
+	debug!("Legacy mapping: {:?}", legacy_gsi_mapping);
 
 	let apic = unsafe { hal::acpi::Handler::new(&hal::acpi::Allocator).map_physical_region::<Apic>(apic_addr as usize, mem::size_of::<Apic>()) };
 	let apic_boxed = unsafe { MmioCell::new(apic.virtual_start().as_ptr()) };
@@ -315,9 +352,23 @@ pub(in crate::hal) fn init(spurious_vector: u8) {
 	}
 
 	let mut timer_lvt = apic_boxed.project::<Apic::timer_lvt>();
+	apic_boxed.project::<Apic::timer_initial_count>().write(0);
 	let val = timer_lvt.read()
 		.with_mask(false);
 	timer_lvt.write(val);
 
-	LAPIC.0.get_or_init(|| IrqCell::new(apic));
+	LAPIC.0.get_or_init(|| unsafe { Syncify::new(IrqCell::new(apic)) });
+}
+
+pub fn send_self_ipi(vector: usize) {
+	assert!(48 <= vector && vector < 256, "Invalid IPI vector");
+	let vector = vector as u32;
+	
+	let lapic = LAPIC.0.get().expect("APIC not initialised");
+	let lapic = lapic.lock();
+	let lapic = unsafe { MmioCell::new(lapic.virtual_start().as_ptr()) };
+	let mut icr = lapic.project::<Apic::icr_low>();
+	while icr.read() & (1 << 12) != 0 { core::hint::spin_loop(); } // wait for any previous pending IPIs to send
+	icr.write(vector | (1 << 14) | (0b01 << 18));
+	while icr.read() & (1 << 12) != 0 { core::hint::spin_loop(); } // wait to send
 }
