@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use core::cell::OnceCell;
 use log::{debug, warn};
-use kernel_api::sync::Mutex;
+use kernel_api::sync::{Mutex, MutexGuard};
 
 pub macro irq_handler {
 	(
@@ -52,19 +52,17 @@ static IRQ_HANDLES: Mutex<BTreeMap<usize, Box<dyn FnMut() /* + Send ???*/>>> = M
 static DEFER_IRQ: OnceCell<Box<dyn Fn()>> = OnceCell::new();
 
 pub fn global_irq_handler(vector: usize) {
+	use kernel_api::sync::MutexGuardExt as _;
+	
 	if vector == 0x30 { (DEFER_IRQ.get().unwrap())(); return; }
 	
-	let flags: u64;
-	unsafe { core::arch::asm!("pushf; pop {}", out(reg) flags); }
-	debug!("flags: {flags:#x}");
-	if let Some(f) = IRQ_HANDLES.lock().get_mut(&vector) {
-		let flags: u64;
-		unsafe { core::arch::asm!("pushf; pop {}", out(reg) flags); }
-		debug!("flags: {flags:#x}");
+	let mut guard = IRQ_HANDLES.lock();
+	if let Some(f) = guard.get_mut(&vector) {
 		(*f)();
 	} else {
 		warn!("Unhandled IRQ: vector {vector}");
 	}
+	MutexGuard::unlock_no_interrupts(guard);
 }
 
 pub fn insert_handler(vector: usize, f: impl FnMut() + 'static) -> Option<()> {
