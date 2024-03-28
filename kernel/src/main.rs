@@ -480,7 +480,10 @@ fn kmain(handoff_data: HandoffWrapper) -> ! {
 		}
 	}
 
-	loop { threading::thread_yield(); }
+	loop {
+		unsafe { asm!("hlt"); }
+		threading::thread_yield();
+	}
 
 	let mut executor = Executor::new();
 	static mut WAKER: Option<Waker> = None;
