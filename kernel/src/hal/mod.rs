@@ -94,7 +94,7 @@ impl ArgTuple for (usize,usize) {
 	}
 }
 
-impl ArgTuple for (usize,usize,usize) {
+/*impl ArgTuple for (usize,usize,usize) {
 	fn as_array(self) -> [MaybeUninit<usize>; 4] {
 		[MaybeUninit::new(self.0), MaybeUninit::new(self.1), MaybeUninit::new(self.2), MaybeUninit::uninit()]
 	}
@@ -104,7 +104,7 @@ impl ArgTuple for (usize,usize,usize,usize) {
 	fn as_array(self) -> [MaybeUninit<usize>; 4] {
 		[MaybeUninit::new(self.0), MaybeUninit::new(self.1), MaybeUninit::new(self.2), MaybeUninit::new(self.3)]
 	}
-}
+}*/
 
 #[derive(Debug)]
 pub struct ThreadControlBlock {
