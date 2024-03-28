@@ -117,6 +117,13 @@ pub fn sleep_until(wake_time: Instant) {
 	pinned_sleep(wake_time);
 }
 
+pub fn exit() -> ! {
+	let mut guard = scheduler::SCHEDULER.lock();
+	guard.queue_for_deletion();
+	drop(guard); // drop guard before end of scope to ensure deferred schedule goes through
+	unreachable!("Returned to deleted task")
+}
+
 #[naked]
 pub unsafe extern "C" fn thread_startup() {
 	extern "C" fn thread_startup_inner() {

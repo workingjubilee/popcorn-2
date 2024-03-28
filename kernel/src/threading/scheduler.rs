@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use alloc::collections::{BTreeMap, VecDeque};
 use core::borrow::Borrow;
 use core::cell::{Cell, UnsafeCell};
@@ -12,9 +13,12 @@ use crate::hal::{HalTy, Hal, ThreadControlBlock, ThreadState};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use log::{debug, warn};
+use kernel_api::memory::physical::highmem;
 use kernel_api::time::Instant;
+use crate::hal::paging2::{TTable, TTableTy};
 use crate::hal::timing::{Timer, Eoi};
 use crate::interrupts::irq_handler;
+use crate::memory::paging::ktable;
 use crate::threading::{EventTy, SchedulerEvent};
 
 #[thread_local]
@@ -95,6 +99,7 @@ pub struct Scheduler {
 	run_queue: VecDeque<Tid>,
 	current_tid: Tid,
 	pub event_queue: EventQueue,
+	cleanup_queue: VecDeque<Tid>,
 }
 
 #[derive(Debug)]
@@ -139,6 +144,21 @@ impl<K, V, A: core::alloc::Allocator + Clone> BTreeExt<K, V> for BTreeMap<K, V, 
 	}
 }
 
+extern "C" fn thread_cleaner(_: ()) -> ! {
+	loop {
+		let mut guard = SCHEDULER.lock();
+		let scheduler = &mut *guard;
+		
+		for tid in scheduler.cleanup_queue.drain(..) {
+			if scheduler.tasks.remove(&tid).is_none() {
+				warn!("Deletion of {tid:?} failed");
+			}
+		}
+		drop(guard);
+		super::block(ThreadState::Blocked);
+	}
+}
+
 impl Scheduler {
 	pub const fn new() -> Self {
 		Self {
@@ -148,8 +168,17 @@ impl Scheduler {
 			event_queue: EventQueue {
 				events: VecDeque::new(),
 				yield_event: None,
-			}
+			},
+			cleanup_queue: VecDeque::new(),
 		}
+	}
+	
+	pub fn queue_for_deletion(&mut self) {
+		let tid = self.current_tid();
+		debug!("delete {tid:?}");
+		self.cleanup_queue.push_back(tid);
+		self.unblock(Tid(1));
+		self.block(ThreadState::AwaitingDeletion);
 	}
 
 	fn wake_and_reset_timer(&mut self) {
@@ -202,6 +231,15 @@ impl Scheduler {
 
 	pub fn init(&mut self, tid0: ThreadControlBlock) {
 		assert!(self.tasks.insert(Tid(0), tid0).is_none(), "Cannot init scheduler multiple times");
+		
+		let ttable = TTableTy::new(&*ktable(), highmem()).unwrap();
+		self.add_task(ThreadControlBlock::new(
+			Cow::Borrowed("Thread cleanup"),
+			ttable,
+			super::thread_startup,
+			thread_cleaner,
+			(),
+		));
 
 		let mut local_timer = <HalTy as Hal>::LocalTimer::get();
 		local_timer.set_irq_number(0x40).unwrap();
