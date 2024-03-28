@@ -146,6 +146,7 @@ pub enum ThreadState {
 	Ready,
 	Running,
 	Blocked,
+	Sleeping,
 }
 
 #[export_name = "__popcorn_enable_irq"]

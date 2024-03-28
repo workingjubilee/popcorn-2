@@ -99,7 +99,7 @@ fn pinned_sleep(time_of_wake: Instant) {
 	};
 	debug!("sleeping tid {:?}", sleep_event.tid);
 	guard.event_queue.add(sleep_event);
-	guard.block(ThreadState::Blocked);
+	guard.block(ThreadState::Sleeping);
 }
 
 pub fn sleep(duration: Duration) {
