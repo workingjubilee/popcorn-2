@@ -233,8 +233,7 @@ impl Timer for LapicTimer {
 		let apic = unsafe { MmioCell::new(borrow.virtual_start().as_ptr()) };
 
 		let val = apic.project::<Apic::timer_lvt>().read()
-		                                            .with_mode(TimerMode::OneShot)
-		                                            .with_mask(false);
+		                                            .with_mode(TimerMode::OneShot);
 		apic.project::<Apic::timer_lvt>().write(val);
 		apic.project::<Apic::timer_initial_count>().write(ticks.try_into()?);
 
@@ -246,8 +245,7 @@ impl Timer for LapicTimer {
 		let apic = unsafe { MmioCell::new(borrow.virtual_start().as_ptr()) };
 
 		let val = apic.project::<Apic::timer_lvt>().read()
-		                     .with_mode(TimerMode::Periodic)
-		                     .with_mask(false);
+		                     .with_mode(TimerMode::Periodic);
 		apic.project::<Apic::timer_lvt>().write(val);
 		apic.project::<Apic::timer_initial_count>().write(ticks.try_into()?);
 
@@ -354,10 +352,10 @@ pub(in crate::hal) fn init(spurious_vector: u8) {
 	}
 
 	let mut timer_lvt = apic_boxed.project::<Apic::timer_lvt>();
+	apic_boxed.project::<Apic::timer_initial_count>().write(0);
 	let val = timer_lvt.read()
 		.with_mask(false);
 	timer_lvt.write(val);
-	apic_boxed.project::<Apic::timer_initial_count>().write(0);
 
 	LAPIC.0.get_or_init(|| unsafe { Syncify::new(IrqCell::new(apic)) });
 }
