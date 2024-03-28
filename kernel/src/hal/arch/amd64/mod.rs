@@ -121,8 +121,11 @@ unsafe impl Hal for Amd64Hal {
 			"mov [rdi + {4}], r13",
 			"mov [rdi + {5}], r14",
 			"mov [rdi + {6}], r15",
+			"pushf",
+			"pop rbx",
+			"mov [rdi + {7}], rbx",
 
-			"mov rax, [rsi + {7}]",
+			"mov rax, [rsi + {8}]",
 			"mov rcx, cr3",
 			"cmp rax, rcx",
 			"je 1f",
@@ -130,6 +133,9 @@ unsafe impl Hal for Amd64Hal {
 			"1:",
 
 			// todo: adjust RSP0 in TSS
+			"mov rbx, [rdi + {7}]",
+			"push rbx",
+			"popf",
 			"mov rbx, [rsi + {0}]",
 			"mov rsp, [rsi + {1}]",
 			"mov rbp, [rsi + {2}]",
@@ -147,6 +153,7 @@ unsafe impl Hal for Amd64Hal {
 			const offset_of!(Amd64SaveState, r13) + offset_of!(ThreadControlBlock, save_state),
 			const offset_of!(Amd64SaveState, r14) + offset_of!(ThreadControlBlock, save_state),
 			const offset_of!(Amd64SaveState, r15) + offset_of!(ThreadControlBlock, save_state),
+			const offset_of!(Amd64SaveState, rflags) + offset_of!(ThreadControlBlock, save_state),
 			const offset_of!(paging2::Amd64TTable, pml4) + offset_of!(ThreadControlBlock, ttable),
 			options(noreturn)
 		);
@@ -164,7 +171,8 @@ struct Amd64SaveState {
 	pub r12: MaybeUninit<usize>,
 	pub r13: MaybeUninit<usize>,
 	pub r14: MaybeUninit<usize>,
-	pub r15: MaybeUninit<usize>
+	pub r15: MaybeUninit<usize>,
+	pub rflags: MaybeUninit<usize>,
 }
 
 impl Default for Amd64SaveState {
@@ -177,6 +185,7 @@ impl Default for Amd64SaveState {
 			r13: MaybeUninit::zeroed(),
 			r14: MaybeUninit::zeroed(),
 			r15: MaybeUninit::zeroed(),
+			rflags: MaybeUninit::zeroed(),
 		}
 	}
 }
