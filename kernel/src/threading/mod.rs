@@ -40,39 +40,8 @@ pub unsafe fn init(handoff_data: crate::HandoffWrapper) -> Tid {
 		state: ThreadState::Running,
 		save_state: Default::default(),
 	};
-	assert!(scheduler.tasks.insert(Tid(0), tcb).is_none());
-
-	let mut local_timer = <HalTy as Hal>::LocalTimer::get();
-	local_timer.set_irq_number(0x40).unwrap();
-	local_timer.set_divisor(4).unwrap();
-
-	let eoi_handle = local_timer.eoi_handle();
-
-	let timer_irq = irq_handler!(move || {
-		main => {
-			let mut guard = scheduler::SCHEDULER.lock();
-			if let Some(to_wake) = guard.sleep_queue.pop_front() {
-				debug!("supposed to wake Tid {:?}", to_wake.tid);
-				guard.unblock(to_wake.tid);
-			} else {
-				warn!("Spurious scheduler timer irq");
-			}
-			recalculate_timer(&mut guard);
-		}
-		eoi => {
-			eoi_handle.send();
-		}
-	});
 	
-	let scheduler_defer_irq = move || {
-		let mut guard = scheduler::SCHEDULER.lock();
-		// FIXME: only true with LAPIC
-		eoi_handle.send(); // safe to send this now since interrupts are disabled by scheduler lock
-		guard.schedule();
-	};
-
-	assert!(crate::interrupts::insert_handler(0x40, timer_irq).is_none());
-	crate::interrupts::set_defer_irq(scheduler_defer_irq);
+	scheduler.init(tcb);
 
 	Tid(0)
 }
@@ -85,72 +54,51 @@ pub fn block(reason: ThreadState) {
 	scheduler::SCHEDULER.lock().block(reason);
 }
 
-#[derive(Debug)]
-struct SleepingTid {
-	time_of_wake: Instant,
+#[derive(Debug, Copy, Clone)]
+struct SchedulerEvent {
+	time: Instant,
 	tid: Tid,
+	action: EventTy,
 }
 
-impl Ord for SleepingTid {
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+enum EventTy {
+	Unblock,
+}
+
+impl Ord for SchedulerEvent {
 	fn cmp(&self, other: &Self) -> Ordering {
-		self.time_of_wake.cmp(&other.time_of_wake)
+		self.time.cmp(&other.time)
 	}
 }
 
-impl PartialOrd for SleepingTid {
+impl PartialOrd for SchedulerEvent {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
-impl PartialEq for SleepingTid {
+impl PartialEq for SchedulerEvent {
 	fn eq(&self, other: &Self) -> bool {
-		self.time_of_wake.eq(&other.time_of_wake)
+		self.time.eq(&other.time)
 	}
 }
 
-impl Eq for SleepingTid {}
+impl Eq for SchedulerEvent {}
 
 fn push_to_global_sleep_queue(wake_time: Instant) {
 	todo!()
 }
 
-fn recalculate_timer(scheduler: &mut scheduler::Scheduler) {
-	let mut local_timer = <HalTy as Hal>::LocalTimer::get();
-	let tick_period = local_timer.get_time_period_picos().unwrap() * 4;
-	
-	loop {
-		let Some(next) = scheduler.sleep_queue.get(0) else { break; };
-		debug!("{:?}", next.time_of_wake);
-		
-		let time_to_wake = next.time_of_wake.saturating_duration_since(Instant::now());
-		debug!("wake {:?} in {time_to_wake:?}", next.tid);
-		
-		if time_to_wake == Duration::from_secs(0) {
-			let next = scheduler.sleep_queue.pop_front().expect("Already peeked so should not have gone");
-			scheduler.unblock(next.tid);
-		} else {
-			let ticks = time_to_wake.as_nanos().saturating_div(u128::from(tick_period) / 1000);
-			if ticks == 0 {
-				let next = scheduler.sleep_queue.pop_front().expect("Already peeked so should not have gone");
-				scheduler.unblock(next.tid);
-			} else {
-				local_timer.set_oneshot_time(ticks).unwrap();
-				break; // We only want to loop if there are more tasks in the past	
-			}
-		}
-	}
-}
-
 fn pinned_sleep(time_of_wake: Instant) {
 	let mut guard = scheduler::SCHEDULER.lock();
-	let sleep_state = SleepingTid {
-		tid: guard.current_tid,
-		time_of_wake
+	let sleep_event = SchedulerEvent {
+		tid: guard.current_tid(),
+		time: time_of_wake,
+		action: EventTy::Unblock
 	};
-	guard.add_to_sleep_queue(sleep_state);
-	debug!("sleeping tid {:?}", guard.current_tid);
-	recalculate_timer(&mut guard);
+	debug!("sleeping tid {:?}", sleep_event.tid);
+	guard.event_queue.add(sleep_event);
 	guard.block(ThreadState::Blocked);
 }
 
